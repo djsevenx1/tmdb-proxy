@@ -1,6 +1,4 @@
 name = "tmdb-proxy"
 compatibility_date = "2024-01-01"
-main = "worker.js"
-
-# 不再在这里设置 API 密钥
-# 密钥将通过环境变量注入
+compatibility_flags = ["nodejs_compat"]
+# Pages 项目用 _worker.js, 不用 main 字段

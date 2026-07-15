@@ -1,19 +1,16 @@
-name: 部署到 Cloudflare Workers
+name: 部署到 Cloudflare Pages
 
 on:
   push:
     branches: [ main ]
     paths:
-      - 'worker.js'
+      - '_worker.js'
       - 'wrangler.toml'
-      - 'package.json'
       - '.github/workflows/deploy.yml'
 
 jobs:
-  deploy:  # job ID 必须使用英文
+  deploy:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
-    
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -26,8 +23,11 @@ jobs:
       - name: 安装 Wrangler
         run: npm install -g wrangler
 
-      - name: 部署到 Cloudflare Workers
+      - name: 部署到 Cloudflare Pages
         run: |
-          wrangler deploy --var TMDB_API_KEY:"${{ secrets.TMDB_API_KEY }}"
+          wrangler pages deploy . \
+            --project-name=tmdb-8d1 \
+            --commit-dirty=true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
