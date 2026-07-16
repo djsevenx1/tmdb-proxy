@@ -1,10 +1,10 @@
-# TMDB + Bangumi 代理 Worker
+# TMDB + Bangumi + GitHub 代理 Worker
 
 > 🔱 **Fork 自 [HuntzzZ/tmdb-proxy](https://github.com/HuntzzZ/tmdb-proxy)** —— 致谢原作者。
-> 本 fork 在原版基础上扩展了 **Bangumi (bangumi.tv / bgm.tv)** 代理能力, 一个 Worker 同时代理 TMDB 和 Bangumi。
-> 📱 **作为 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.41+ 的官方 backend** — 配套 worker URL 输到 App 「TMDB / Bangumi 代理 URL」, 一键加速 TMDB + Bangumi。
+> 本 fork 在原版基础上扩展了 **Bangumi (bangumi.tv / bgm.tv)** 代理能力, 一个 Worker 同时代理 TMDB、Bangumi 和 **GitHub Releases**。
+> 📱 **作为 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.46+ 的官方 backend** — 配套 worker URL 输到 App 「TMDB / Bangumi 代理 URL」+「GitHub 代理 URL」, 一键加速 TMDB + Bangumi + GitHub (检查更新 / APK 下载)。
 
-一个基于 Cloudflare Workers 的 API 代理服务, 用于解决影视库 / 弹幕网刮削工具的跨域访问问题。支持完整的 TMDB API + 图片代理, **并新增 Bangumi API + Bangumi 图片代理**。
+一个基于 Cloudflare Workers 的 API 代理服务, 用于解决影视库 / 弹幕网刮削工具的跨域访问问题, **并配套 App 内建更新器走 worker 拉 GitHub release**。支持完整的 TMDB API + 图片代理, 新增 Bangumi API + 图片代理, **v2.1.46 新增 GitHub Releases API + release assets 流式下载代理**。
 
 部署在 Cloudflare Pages (识别 `_worker.js`), 不是 Cloudflare Workers 经典模式。
 
@@ -28,6 +28,7 @@
 - [x] GitHub 账户 (用 Actions 自动部署) 或 Node.js 16+ (手动部署)
 - [x] *(可选)* TMDB API 密钥 ([申请地址](https://www.themoviedb.org/settings/api)) — 不配也能用, 见 `?api_key=` 客户端透传
 - [x] *(可选)* Bangumi access_token, 配 `BGM_ACCESS_TOKEN` env 后服务端注入, 客户端无需自带
+- [x] *(可选)* GitHub PAT, 配 `GITHUB_TOKEN` env 后拉高 60/hr → 5000/hr 速率限制. 不配走匿名 60/hr, 检查更新够用
 
 ### 方式一: GitHub Actions 自动部署到 Cloudflare Pages (推荐)
 
@@ -39,6 +40,7 @@
    - `CLOUDFLARE_ACCOUNT_ID`: Cloudflare 账户 ID (Workers & Pages 详情页右侧栏可查)
    - *(可选)* `TMDB_API_KEY`: 服务端持有的 TMDB API Key. 不配也行, 见 `?api_key=` 透传
    - *(可选)* `Bgm_ACCESS_TOKEN`: 服务端持有的 Bangumi access_token
+   - *(可选)* `GITHUB_TOKEN`: GitHub Personal Access Token, 拉高 60/hr → 5000/hr 速率限制 (v2.1.46+ GitHub 路由用)
 3. **配置 Pages 项目名**: 编辑 `.github/workflows/deploy.yml` 里的 `project-name=tmdb-proxy` 改成你想要的
 4. **推送代码到 main 分支自动部署**
 
@@ -49,7 +51,7 @@
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **Create application** → **Pages** → **Upload assets** (直接上传)
 2. **Project name**: 自取, 如 `tmdb-proxy`
 3. 拖入整个项目根目录 (含 `_worker.js` / `worker.js` / `wrangler.toml`) → **Deploy site**
-4. 部署完 → **Settings** → **Environment variables** 配置 (可选) `TMDB_API_KEY` / `Bgm_ACCESS_TOKEN`
+4. 部署完 → **Settings** → **Environment variables** 配置 (可选) `TMDB_API_KEY` / `Bgm_ACCESS_TOKEN` / `GITHUB_TOKEN`
 5. 访问 `https://<project>.pages.dev/` 看 LunaTV 风主页
 
 > ⚠️ **重要**: Cloudflare Pages 识别 Worker 用 **`_worker.js`** (下划线开头) 约定文件, 不是 `worker.js`。
@@ -164,6 +166,36 @@ GET /bgm-img/r/200/char_id/123.jpg
 
 > 路径格式: `/bgm-img/{lain.bgm.tv 上的完整路径}`, 任意 `lain.bgm.tv` 下的资源都可代理。
 
+## 🐙 GitHub 代理 (v2.1.46+ 新增)
+
+> 配套 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.46+ **app 内建更新器** (检查更新 + APK 下载), 解决国内 GFW 完全拉不到 `api.github.com` / `objects.githubusercontent.com` 的问题。
+> 走 worker 反代 + CORS 头, App 端无感知, 进度条 / 取消 / 重试 / 调起 APK 安装器 都在 App 内完成, **不跳浏览器, 不用第三方 pub package**。
+
+### Releases API 代理示例
+
+**获取最新 release** (app 检查更新用):
+```
+GET /github/repos/djsevenx1/LunaTV-Mobile/releases/latest
+```
+
+**获取所有 releases**:
+```
+GET /github/repos/{owner}/{repo}/releases
+```
+
+> 任意 path-based 调用: `/github/repos/{owner}/{repo}/{path...}` → `https://api.github.com/repos/{owner}/{repo}/{path...}`
+> Worker 自动加 `Accept: application/vnd.github.v3+json` + `User-Agent` (强制, GitHub API 拒空 UA). 配 `GITHUB_TOKEN` env 后自动注入 `Authorization` Bearer, 拉高 60/hr → 5000/hr 速率限制.
+
+### Release asset 下载代理示例
+
+**下载 APK** (app 内建下载器拿 APK 用):
+```
+GET /github/asset/djsevenx1/LunaTV-Mobile/v2.1.46/app-arm64-v8a-release.apk
+```
+
+> 格式: `/github/asset/{owner}/{repo}/{tag}/{asset_name}`
+> Worker 内部转成 `https://github.com/{owner}/{repo}/releases/download/{tag}/{asset_name}` 跟 302 跳到 `objects.githubusercontent.com` 流式转发. **不 buffer 整 APK 到内存**, 几十 MB APK 直接 stream, 跟用户在代理浏览器下效果一样, 但 app 内可以画进度条.
+
 ## 🏠 主页 (Homepage)
 
 > 根路径 `/` 返 LunaTV 风的 HTML 主页, 跟 worker 状态 / 路由表 / 致谢一目了然, 不用再手敲 `/health` 验证。
@@ -177,19 +209,20 @@ GET /bgm-img/r/200/char_id/123.jpg
 
 `/health` 端点也保留, 返纯文本 `OK`, 适合 CI 健康检查。
 
-## 📱 LunaTV-Mobile 集成 (v2.1.41+)
+## 📱 LunaTV-Mobile 集成 (v2.1.46+)
 
-> 🎯 **本 repo 是 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.41+ 的官方 backend**。
+> 🎯 **本 repo 是 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.46+ 的官方 backend**。
 
 部署完本 worker, 拿到的 `https://<project>.pages.dev` 粘到 LunaTV-Mobile App 的:
-**设置 → 数据源 → TMDB / Bangumi 代理 URL**
+**设置 → 数据源 → TMDB / Bangumi 代理 URL** + **设置 → 数据源 → GitHub 代理 URL**
 
 配了后, App 内:
 - **TMDB 数据源 / 图片源** → 走 `${workerUrl}/movie/...` + `${workerUrl}/image/...`
 - **Bangumi 数据源 / 图片源** → 走 `${workerUrl}/bangumi/...` + `${workerUrl}/bgm-img/...`
+- **检查更新 + APK 下载** (v2.1.46+ 内建下载器) → 走 `${workerUrl}/github/repos/.../releases/latest` + `${workerUrl}/github/asset/.../releases/download/...`
 - **TMDB API Key** → 直接从 App 读, worker 端 `?api_key=` 透传, 不用去 Cloudflare Dashboard 配 env
 
-一个 worker 同时加速 TMDB + Bangumi 两套数据, 解决国内 GFW。
+一个 worker 同时加速 TMDB + Bangumi + GitHub 三套数据, 解决国内 GFW (TMDB 没 GFW 但网络慢, Bangumi 偶尔抽风, GitHub 100% 拉不到). 推荐填同一个 worker URL 即可.
 
 ## 🔧 刮削工具配置
 
@@ -313,6 +346,7 @@ wrangler whoami
 **❌ 速率限制错误**
 - TMDB 限制：30-40 请求/10秒
 - Bangumi 限制：详见 [api.bgm.tv 文档](https://bangumi.github.io/api/)
+- GitHub 限制：匿名 60/hr, 配 `GITHUB_TOKEN` 后 5000/hr
 - 建议添加缓存减少调用
 
 ### 日志查看
@@ -367,16 +401,18 @@ README 更新不会触发不必要的部署。
 
 本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
 
-> **致谢**:
+> **致谢 & Changelog**:
 > - 本项目 fork 自 [HuntzzZ/tmdb-proxy](https://github.com/HuntzzZ/tmdb-proxy), 感谢原作者 [@HuntzzZ](https://github.com/HuntzzZ) 的优秀实现
-> - 本 fork 在原作者授权 (MIT) 基础上扩展 Bangumi 代理能力, 改动记录见 commit history
-> - 作为 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.41+ 的官方 backend, 配合 App 一键加速 TMDB + Bangumi
+> - 本 fork 在原作者授权 (MIT) 基础上扩展 Bangumi + GitHub 代理能力, 改动记录见 commit history
+> - 作为 [LunaTV-Mobile](https://github.com/djsevenx1/LunaTV-Mobile) v2.1.46+ 的官方 backend, 配合 App 一键加速 TMDB + Bangumi + GitHub
+> - **v2.1.46** 新增 GitHub Releases API + release assets 流式下载代理 (`/github/repos/.../releases/latest` + `/github/asset/{owner}/{repo}/{tag}/{asset}`), 配套 App 内建下载器
 
 ## ⚠️ 免责声明
 
 本项目仅用于学习和研究目的，请遵守：
 - [TMDB API 使用条款](https://www.themoviedb.org/documentation/api/terms-of-use)
 - [Bangumi API 使用条款](https://bgm.tv/about/guideline)
+- [GitHub API 使用条款](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)
 - Cloudflare Workers 服务条款
 - 当地法律法规
 
