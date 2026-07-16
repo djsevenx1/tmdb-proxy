@@ -51,6 +51,24 @@ export default {
         return await handleBgmApi(request, url, env, corsHeaders)
       }
 
+      // v2.1.46 fix: GitHub asset 代理 (app 内建下载器下 APK 用) —
+      //   必须在 /github/ 通用路由之前匹配, 避免 asset path 被通用
+      //   路由吞掉 (asset 路径是 /github/asset/owner/repo/tag/asset,
+      //   跟 /github/repos/.../releases/latest 形态不同, 单独 handler
+      //   做 302 跳 objects.githubusercontent.com 流式转发).
+      // v2.1.49 改: 之前 v2.1.46 commit 漏了这 2 个路由分发块, 只
+      //   加了 handleGithubApi / handleGithubAsset 函数定义, fetch
+      //   handler 里没 if 调它们, 导致 /github/... 全部落到兜底
+      //   handleTmdbApi 报 "TMDB API key not configured". 修.
+      if (url.pathname.startsWith('/github/asset/')) {
+        return await handleGithubAsset(request, url, corsHeaders)
+      }
+
+      // v2.1.46 fix: GitHub Releases API 代理 (app 检查更新用)
+      if (url.pathname.startsWith('/github/')) {
+        return await handleGithubApi(request, url, env, corsHeaders)
+      }
+
       // TMDB 图片代理
       if (url.pathname.startsWith('/image/')) {
         return await handleTmdbImage(request, url, corsHeaders)
