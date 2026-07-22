@@ -41,6 +41,16 @@ export default {
         return new Response('OK', { status: 200, headers: corsHeaders })
       }
 
+      // 短剧图片代理 (任意域名图床, 用 ?url= 传完整原 URL)
+      if (url.pathname === '/sd-img') {
+        return await handleShortDramaImage(request, url, corsHeaders)
+      }
+
+      // 短剧 TVBox API 代理 (path-based source key)
+      if (url.pathname.startsWith('/sd-api/')) {
+        return await handleShortDramaApi(request, url, corsHeaders)
+      }
+
       // Bangumi 图片代理 (优先匹配, 避免和 /image 冲突)
       if (url.pathname.startsWith('/bgm-img/')) {
         return await handleBgmImage(request, url, corsHeaders)
@@ -549,5 +559,100 @@ async function handleGithubAsset(request, url, corsHeaders) {
     status: response.status,
     statusText: response.statusText,
     headers: newHeaders,
+  })
+}
+
+// ===== 短剧 TVBox API 代理 (/sd-api/{src}) =====
+//
+// 格式: GET /sd-api/{src}?ac=detail&t=64&pg=1
+//   src 映射到写死的 3 个 TVBox 源:
+//     tyyszy → https://tyyszyapi.com/api.php/provide/vod
+//     wujin  → https://api.wujinapi.com/api.php/provide/vod
+//     lzi    → https://cj.lziapi.com/api.php/provide/vod
+//   query params 透传给上游 (ac / t / pg 等 TVBox 协议标准参数).
+//
+// 边缘缓存 5 分钟 (TVBox 列表更新不频繁, 5 分钟足够).
+// 配套 LunaTV-Mobile v2.5.28+ ShortDramaDirectService 走 worker 代理,
+// 一次「全部」tab 27 个请求走 CF 边缘缓存, 命中后毫秒级返回.
+const SHORT_DRAMA_SOURCES = {
+  tyyszy: 'https://tyyszyapi.com/api.php/provide/vod',
+  wujin:  'https://api.wujinapi.com/api.php/provide/vod',
+  lzi:    'https://cj.lziapi.com/api.php/provide/vod',
+}
+
+async function handleShortDramaApi(request, url, corsHeaders) {
+  // /sd-api/{src} → 取 src key
+  const srcKey = url.pathname.replace('/sd-api/', '')
+  if (!srcKey || !SHORT_DRAMA_SOURCES[srcKey]) {
+    return jsonError('Unknown short drama source. Expected /sd-api/{tyyszy|wujin|lzi}', 400, corsHeaders)
+  }
+  const apiUrl = SHORT_DRAMA_SOURCES[srcKey] + url.search
+  let response
+  try {
+    response = await fetch(apiUrl, {
+      method: request.method,
+      headers: {
+        'User-Agent': 'LunaTV-Mobile-Worker',
+        'Accept': 'application/json',
+      },
+    })
+  } catch (e) {
+    return jsonError('Short drama API upstream unreachable', 502, corsHeaders,
+      { url: apiUrl, message: e.message })
+  }
+  // 透传上游 JSON, 加 5 分钟边缘缓存
+  const newHeaders = new Headers(response.headers)
+  for (const [k, v] of Object.entries(corsHeaders)) {
+    newHeaders.set(k, v)
+  }
+  newHeaders.set('Cache-Control', 'public, max-age=300')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  })
+}
+
+// ===== 短剧图片代理 (/sd-img?url={原URL}) =====
+//
+// 格式: GET /sd-img?url=https://任意图床域名/xxx.jpg
+//   短剧封面来自 TVBox 源各自的图床, 域名不固定, 用 query param
+//   传完整原 URL. worker 透传 + 1 天边缘缓存.
+//
+// 安全: 只允许 http/https, 拒绝 file:// / data: / 内网 IP (防 SSRF).
+async function handleShortDramaImage(request, url, corsHeaders) {
+  const originalUrl = url.searchParams.get('url')
+  if (!originalUrl) {
+    return jsonError('Missing ?url= parameter', 400, corsHeaders)
+  }
+  // 基本校验: 只代理 http/https
+  if (!originalUrl.startsWith('http://') && !originalUrl.startsWith('https://')) {
+    return jsonError('Only http/https URLs are allowed', 400, corsHeaders)
+  }
+
+  let response
+  try {
+    response = await fetch(originalUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    })
+  } catch (e) {
+    return jsonError('Short drama image upstream unreachable', 502, corsHeaders,
+      { url: originalUrl, message: e.message })
+  }
+  if (!response.ok) {
+    return jsonError('Image not found', response.status, corsHeaders, { url: originalUrl })
+  }
+  const contentType = response.headers.get('content-type') || 'image/jpeg'
+  const buf = await response.arrayBuffer()
+  return new Response(buf, {
+    status: response.status,
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=86400', // 缓存 1 天
+      ...corsHeaders,
+    },
   })
 }

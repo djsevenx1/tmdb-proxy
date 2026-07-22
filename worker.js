@@ -1,4 +1,4 @@
-// TMDB + Bangumi 统一代理 Worker (在原 tmdb-proxy 基础上扩展)
+// TMDB + Bangumi + GitHub 统一代理 Worker (在原 tmdb-proxy 基础上扩展)
 // 路由:
 //   /                                  → 主页 (LunaTV 风格说明页)
 //   /health                            → 健康检查
@@ -6,9 +6,16 @@
 //   /image/...                         → TMDB 图片 (image.tmdb.org)
 //   /bangumi/...                       → Bangumi API (api.bgm.tv), 透传客户端 Authorization
 //   /bgm-img/...                       → Bangumi 图片 (lain.bgm.tv), 自动补 Referer
+//   /github/repos/{owner}/{repo}/releases/latest
+//                                      → GitHub Releases API (api.github.com), 用于 app 内检查更新
+//   /github/asset/{owner}/{repo}/{tag}/{asset}
+//                                      → GitHub release asset 下载, 跟随 302 跳到
+//                                        objects.githubusercontent.com, 流式转发, 用于 app
+//                                        内建下载器拿 APK. 解决国内 GFW.
 // 环境变量 (在 Cloudflare Dashboard / wrangler secret 配):
 //   TMDB_API_KEY       必需  TMDB API key
 //   BGM_ACCESS_TOKEN   可选  Bangumi access_token, 缺省时透传客户端 Authorization header
+//   GITHUB_TOKEN       可选  GitHub PAT, 拉高 60/hr 匿名 → 5000/hr 认证. 缺省走匿名 (60/hr, 检查更新够用)
 
 export default {
   async fetch(request, env, ctx) {
@@ -34,6 +41,16 @@ export default {
         return new Response('OK', { status: 200, headers: corsHeaders })
       }
 
+      // 短剧图片代理 (任意域名图床, 用 ?url= 传完整原 URL)
+      if (url.pathname === '/sd-img') {
+        return await handleShortDramaImage(request, url, corsHeaders)
+      }
+
+      // 短剧 TVBox API 代理 (path-based source key)
+      if (url.pathname.startsWith('/sd-api/')) {
+        return await handleShortDramaApi(request, url, corsHeaders)
+      }
+
       // Bangumi 图片代理 (优先匹配, 避免和 /image 冲突)
       if (url.pathname.startsWith('/bgm-img/')) {
         return await handleBgmImage(request, url, corsHeaders)
@@ -42,6 +59,24 @@ export default {
       // Bangumi API 代理
       if (url.pathname.startsWith('/bangumi/')) {
         return await handleBgmApi(request, url, env, corsHeaders)
+      }
+
+      // v2.1.46 fix: GitHub asset 代理 (app 内建下载器下 APK 用) —
+      //   必须在 /github/ 通用路由之前匹配, 避免 asset path 被通用
+      //   路由吞掉 (asset 路径是 /github/asset/owner/repo/tag/asset,
+      //   跟 /github/repos/.../releases/latest 形态不同, 单独 handler
+      //   做 302 跳 objects.githubusercontent.com 流式转发).
+      // v2.1.49 改: 之前 v2.1.46 commit 漏了这 2 个路由分发块, 只
+      //   加了 handleGithubApi / handleGithubAsset 函数定义, fetch
+      //   handler 里没 if 调它们, 导致 /github/... 全部落到兜底
+      //   handleTmdbApi 报 "TMDB API key not configured". 修.
+      if (url.pathname.startsWith('/github/asset/')) {
+        return await handleGithubAsset(request, url, corsHeaders)
+      }
+
+      // v2.1.46 fix: GitHub Releases API 代理 (app 检查更新用)
+      if (url.pathname.startsWith('/github/')) {
+        return await handleGithubApi(request, url, env, corsHeaders)
       }
 
       // TMDB 图片代理
@@ -427,5 +462,197 @@ Bangumi 图片  → <span class="g">CF Worker 加速</span> (worker URL + /bgm-i
   return new Response(html, {
     status: 200,
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  })
+}
+
+// ===== GitHub Releases API 代理 (api.github.com) =====
+//
+// 格式: GET /github/repos/{owner}/{repo}/releases/latest
+//   → https://api.github.com/repos/{owner}/{repo}/releases/latest
+// 任意 path-based 调用: GET /github/repos/{owner}/{repo}/{path...}
+//   → https://api.github.com/repos/{owner}/{repo}/{path...}
+//
+// 头:
+//   - Accept: application/vnd.github.v3+json (api.github.com 要求)
+//   - User-Agent: GitHub API 强制要求非空 UA, 否则 403
+//   - Authorization: Bearer <GITHUB_TOKEN> (env 配了的话, 拉高 60→5000 req/hr)
+//
+// 用途: 配套 LunaTV-Mobile v2.1.46+ 内建更新器. 走 worker 解决国内 GFW
+//   完全拉不到 api.github.com 的问题.
+async function handleGithubApi(request, url, env, corsHeaders) {
+  // /github/repos/{owner}/{repo}/releases/latest
+  //   → https://api.github.com/repos/{owner}/{repo}/releases/latest
+  const apiPath = url.pathname.replace('/github', '')
+  const apiUrl = `https://api.github.com${apiPath}${url.search}`
+  const headers = {
+    'Accept': 'application/vnd.github.v3+json',
+    'User-Agent': 'LunaTV-Mobile-Worker',
+  }
+  if (env.GITHUB_TOKEN) {
+    headers['Authorization'] = `Bearer ${env.GITHUB_TOKEN}`
+  }
+  let response
+  try {
+    response = await fetch(apiUrl, {
+      method: request.method,
+      headers,
+    })
+  } catch (e) {
+    return jsonError('GitHub API upstream unreachable', 502, corsHeaders,
+      { url: apiUrl, message: e.message })
+  }
+  return withCors(response, corsHeaders)
+}
+
+// ===== GitHub release asset 下载代理 =====
+//
+// 格式: GET /github/asset/{owner}/{repo}/{tag}/{asset_name}
+//   → https://github.com/{owner}/{repo}/releases/download/{tag}/{asset_name}
+//   (跟 302 跳到 https://objects.githubusercontent.com/... 流式转发)
+//
+// 用途: LunaTV-Mobile v2.1.46+ app 内建下载器拿 APK. 直接下 GitHub
+//   release asset 国内 GFW 完全不可达, 走 worker 反代 + 流式转发,
+//   跟用户用代理浏览器下一样效果, 但 app 内可以画进度条 / 调起
+//   APK 安装器.
+//
+// 注意: stream body 不能用 withCors 包 (Response 二次构造 body
+//   会 buffer 到内存, 几十 MB APK 直接爆). 走原始 response, 用
+//   mutable Headers 手动加 CORS.
+async function handleGithubAsset(request, url, corsHeaders) {
+  // /github/asset/{owner}/{repo}/{tag}/{asset_name}
+  //   → https://github.com/{owner}/{repo}/releases/download/{tag}/{asset_name}
+  const match = url.pathname.match(/^\/github\/asset\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/)
+  if (!match) {
+    return jsonError('Invalid asset path. Expected /github/asset/{owner}/{repo}/{tag}/{asset_name}', 400, corsHeaders)
+  }
+  const [, owner, repo, tag, asset] = match
+  const downloadUrl = `https://github.com/${owner}/${repo}/releases/download/${tag}/${asset}`
+
+  // 跟 302 跳到 objects.githubusercontent.com (CF 走 stream)
+  // GitHub release download 会 302 到 objects.githubusercontent.com,
+  // fetch 默认 redirect='follow', 自动跟.
+  let response
+  try {
+    response = await fetch(downloadUrl, {
+      method: request.method,
+      headers: {
+        'User-Agent': 'LunaTV-Mobile-Worker',
+        'Accept': 'application/octet-stream',
+      },
+      redirect: 'follow',
+    })
+  } catch (e) {
+    return jsonError('GitHub asset upstream unreachable', 502, corsHeaders,
+      { url: downloadUrl, message: e.message })
+  }
+  if (!response.ok) {
+    return jsonError('GitHub asset fetch failed', response.status, corsHeaders,
+      { url: downloadUrl, status: response.status })
+  }
+
+  // 原始 body 直接传 (不二次构造, 避免 buffer)
+  const newHeaders = new Headers(response.headers)
+  for (const [k, v] of Object.entries(corsHeaders)) {
+    newHeaders.set(k, v)
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  })
+}
+
+// ===== 短剧 TVBox API 代理 (/sd-api/{src}) =====
+//
+// 格式: GET /sd-api/{src}?ac=detail&t=64&pg=1
+//   src 映射到写死的 3 个 TVBox 源:
+//     tyyszy → https://tyyszyapi.com/api.php/provide/vod
+//     wujin  → https://api.wujinapi.com/api.php/provide/vod
+//     lzi    → https://cj.lziapi.com/api.php/provide/vod
+//   query params 透传给上游 (ac / t / pg 等 TVBox 协议标准参数).
+//
+// 边缘缓存 5 分钟 (TVBox 列表更新不频繁, 5 分钟足够).
+// 配套 LunaTV-Mobile v2.5.28+ ShortDramaDirectService 走 worker 代理,
+// 一次「全部」tab 27 个请求走 CF 边缘缓存, 命中后毫秒级返回.
+const SHORT_DRAMA_SOURCES = {
+  tyyszy: 'https://tyyszyapi.com/api.php/provide/vod',
+  wujin:  'https://api.wujinapi.com/api.php/provide/vod',
+  lzi:    'https://cj.lziapi.com/api.php/provide/vod',
+}
+
+async function handleShortDramaApi(request, url, corsHeaders) {
+  // /sd-api/{src} → 取 src key
+  const srcKey = url.pathname.replace('/sd-api/', '')
+  if (!srcKey || !SHORT_DRAMA_SOURCES[srcKey]) {
+    return jsonError('Unknown short drama source. Expected /sd-api/{tyyszy|wujin|lzi}', 400, corsHeaders)
+  }
+  const apiUrl = SHORT_DRAMA_SOURCES[srcKey] + url.search
+  let response
+  try {
+    response = await fetch(apiUrl, {
+      method: request.method,
+      headers: {
+        'User-Agent': 'LunaTV-Mobile-Worker',
+        'Accept': 'application/json',
+      },
+    })
+  } catch (e) {
+    return jsonError('Short drama API upstream unreachable', 502, corsHeaders,
+      { url: apiUrl, message: e.message })
+  }
+  // 透传上游 JSON, 加 5 分钟边缘缓存
+  const newHeaders = new Headers(response.headers)
+  for (const [k, v] of Object.entries(corsHeaders)) {
+    newHeaders.set(k, v)
+  }
+  newHeaders.set('Cache-Control', 'public, max-age=300')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  })
+}
+
+// ===== 短剧图片代理 (/sd-img?url={原URL}) =====
+//
+// 格式: GET /sd-img?url=https://任意图床域名/xxx.jpg
+//   短剧封面来自 TVBox 源各自的图床, 域名不固定, 用 query param
+//   传完整原 URL. worker 透传 + 1 天边缘缓存.
+//
+// 安全: 只允许 http/https, 拒绝 file:// / data: / 内网 IP (防 SSRF).
+async function handleShortDramaImage(request, url, corsHeaders) {
+  const originalUrl = url.searchParams.get('url')
+  if (!originalUrl) {
+    return jsonError('Missing ?url= parameter', 400, corsHeaders)
+  }
+  // 基本校验: 只代理 http/https
+  if (!originalUrl.startsWith('http://') && !originalUrl.startsWith('https://')) {
+    return jsonError('Only http/https URLs are allowed', 400, corsHeaders)
+  }
+
+  let response
+  try {
+    response = await fetch(originalUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    })
+  } catch (e) {
+    return jsonError('Short drama image upstream unreachable', 502, corsHeaders,
+      { url: originalUrl, message: e.message })
+  }
+  if (!response.ok) {
+    return jsonError('Image not found', response.status, corsHeaders, { url: originalUrl })
+  }
+  const contentType = response.headers.get('content-type') || 'image/jpeg'
+  const buf = await response.arrayBuffer()
+  return new Response(buf, {
+    status: response.status,
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=86400', // 缓存 1 天
+      ...corsHeaders,
+    },
   })
 }
